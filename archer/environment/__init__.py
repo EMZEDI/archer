@@ -7,3 +7,4 @@ from .adventure_env import BatchedAdventureEnv
 from .guess_my_city import BatchedGuessMyCityEnv
 from .webshop import BatchedWebShopEnv
 from .llm_twenty_questions_subset import LLMBatchedTwentyQuestionsEnv
+from .gsm8k import BatchedGSM8KEnv

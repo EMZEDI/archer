@@ -2,7 +2,7 @@ import torch
 import transformers
 from tqdm import tqdm
 from archer.environment import TwentyQuestionsEnv, BatchedTwentyQuestionsEnv,\
-    BatchedAdventureEnv, BatchedGuessMyCityEnv, BatchedWebShopEnv
+    BatchedAdventureEnv, BatchedGuessMyCityEnv, BatchedWebShopEnv, BatchedGSM8KEnv
 from archer.models import ArcherAgent, CHAIAgent
 from archer.algorithms import offpolicy_train_loop
 from archer.prompts import MISTRAL_TWENTY_QUESTIONS_TEMPLATE, mistral_twenty_questions_decode_actions
@@ -18,7 +18,7 @@ from datetime import timedelta
 from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
 transformers.logging.set_verbosity_error()
 
-CONFIG_NAME = "archer_20q"
+CONFIG_NAME = "archer_gsm8k" 
 @hydra.main(version_base=None, config_path="./config/", config_name=CONFIG_NAME)
 def main(config: "DictConfig"):
     colorful_print(">>> Configuration file: "+CONFIG_NAME+"<<<", fg='blue')
@@ -52,6 +52,13 @@ def main(config: "DictConfig"):
                                 upper=config.webshop_upper,
                                 env_load_path=config.env_load_path)
         eval_env = env
+    elif config.env_name == "gsm8k":
+        env = BatchedGSM8KEnv(batch_size=config.get('batch_size', 32),
+                              max_steps=config.get('max_steps', 10), 
+                              step_penalty=config.get('step_penalty', -0.05),
+                              device=device,
+                              dataset_path=config.get('dataset_path', 'dataset/gsm8k_solutions_gpt4o.jsonl'))
+        eval_env = env
     else:
         raise NotImplementedError("Environment not implemented.")
     decode_f = lambda x:x
@@ -71,7 +78,7 @@ def main(config: "DictConfig"):
                             temperature=config.temperature, do_sample=config.do_sample, 
                             policy_lm=config.policy_lm, critic_lm=config.critic_lm,
                             cache_dir=config.cache_dir, max_new_tokens=config.max_new_tokens,
-                            eos_str='\n')
+                            eos_str=config.get('eos_str', '\n'))
     elif config.agent_type.lower() == "archer_llm":
         #only twenty questions is supported for LLM ArCHer
         print(">>> Using ArCHer agent with LLM")

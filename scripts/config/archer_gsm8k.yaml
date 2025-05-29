@@ -1,0 +1,44 @@
+# GSM8K Configuration
+env_name: "gsm8k"
+dataset_path: "dataset/gsm8k_solutions_gpt4o.jsonl"
+max_steps: 10
+step_penalty: -0.05
+
+# Agent configuration
+agent_type: "archer"
+policy_lm: "microsoft/DialoGPT-medium"
+critic_lm: "roberta-base"
+temperature: 0.99
+do_sample: true
+max_new_tokens: 128  # Longer for math reasoning
+
+# Training configuration
+batch_size: 16
+rollout_size: 32
+iterations: 2000
+epochs: 50
+actor_epochs: 3
+grad_accum_steps: 16
+warmup_iter: 20
+
+# Learning rates
+critic_lr: 2e-5
+lm_lr: 5e-6
+
+# RL parameters
+# gamma: 0.95
+# tau: 0.1
+# max_grad_norm: 1.0
+
+# Evaluation
+eval_freq: 100
+save_freq: 500
+save_path: "/scratch/s/shahradm/archer/checkpoints/gsm8k_archer"
+
+# Wandb
+use_wandb: true
+project_name: "archer-gsm8k"
+run_name: "gsm8k-baseline"
+
+# Paths
+cache_dir: "/scratch/s/shahradm/.cache"

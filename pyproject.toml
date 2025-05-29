@@ -89,6 +89,7 @@ dependencies = [
     "wandb",
     "beautifulsoup4",
     "sentencepiece",
+    "pytest>=8.3.5",
 ]
 
 [project.urls]

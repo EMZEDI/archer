@@ -11,8 +11,8 @@ class DoubleCritic(torch.nn.Module):
         super(DoubleCritic, self).__init__()
         self.device = device
         self.accelerator = accelerator
-        self.base_lm = AutoModel.from_pretrained(critic_lm, cache_dir=cache_dir).to(device)
-        self.base_tokenizer = AutoTokenizer.from_pretrained(critic_lm, cache_dir=cache_dir)
+        self.base_lm = AutoModel.from_pretrained(critic_lm).to(device)
+        self.base_tokenizer = AutoTokenizer.from_pretrained(critic_lm)
         self.base_tokenizer.truncation_side = 'left'
         self.critic1 = nn.Sequential(nn.Linear(in_dim*2, in_dim),\
                                     nn.ReLU(),\
