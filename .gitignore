@@ -10,3 +10,5 @@
 *.pt
 *.venv/
 *.env
+scripts/config/default.yaml
+*logs*/

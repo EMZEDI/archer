@@ -3,12 +3,12 @@ defaults:
   - _self_
 
 # checkpoint
-checkpoint_path: '/global/scratch/users/yifeizhou/20q/twenty_questions_gpt2_model0_full.pt'
-save_path: '/global/scratch/users/yifeizhou/20q/archer_20q_15'
+checkpoint_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/gpt2_bc_20q.pt'
+save_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/gpt2_bc_20q_HRL.pt'
 
 # env
 env_name: twenty_questions
-env_load_path: '/global/scratch/users/yifeizhou/20q/20q_t5_oracle.pt'
+env_load_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/20q_t5_oracle.pt'
 
 # training hyperparameters
 rollout_size: 128 #number of rollout trajectories for each update

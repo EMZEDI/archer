@@ -134,6 +134,28 @@ def offpolicy_train_loop(env,\
         else:
             # data = list(filter(lambda x: x["reward"] >0, data))
             info.update(trainer.update(replay_buffer, no_update_actor = (i < warmup_iter)))
+        
+        # Add comprehensive V-function evaluation using trajectories
+        if (i+1) % eval_freq == 0 and len(all_trajectories) > 10:
+            print(">>>Evaluating V-functions on trajectories")
+            try:
+                trajectory_metrics = trainer.evaluate_v_functions_on_trajectories(
+                    all_trajectories, 
+                    n_trajectories=min(50, len(all_trajectories))
+                )
+                info.update(trajectory_metrics)
+                
+                # Print key metrics for monitoring
+                if 'trajectory_eval.v_min.pearson_corr' in trajectory_metrics:
+                    print(f"V-function trajectory evaluation - "
+                          f"V_min correlation: {trajectory_metrics['trajectory_eval.v_min.pearson_corr']:.4f}, "
+                          f"MSE: {trajectory_metrics['trajectory_eval.v_min.mse']:.4f}, "
+                          f"Explained variance: {trajectory_metrics['trajectory_eval.v_min.explained_variance']:.4f}")
+                          
+            except Exception as e:
+                print(f"Trajectory V-function evaluation failed: {e}")
+                info.update({'trajectory_eval.status': 'failed', 'trajectory_eval.error': str(e)})
+        
         if use_wandb and accelerator.is_main_process:
             wandb.log(info)
         if (i+1) % save_freq == 0 and save_path is not None and accelerator.is_main_process:

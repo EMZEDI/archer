@@ -9,6 +9,8 @@ from typing import Tuple
 import random
 import copy
 import time
+import numpy as np
+from collections import defaultdict
 def dict_mean(dict_list):
     mean_dict = {}
     if len(dict_list) > 0:
@@ -152,7 +154,7 @@ class ArcherTrainer():
                 "residual_advantages.min": torch.min(residual_advantage),
                 "residual_advantages.std": torch.std(residual_advantage),}
 
-    def update(self, replay_buffer, no_update_actor=False):
+    def update(self, replay_buffer, no_update_actor=False, eval_value_functions=True, eval_freq=10):
         self.step += 1
         info = {}
         info_list = []
@@ -240,7 +242,361 @@ class ArcherTrainer():
                 self.accelerator.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
                 self.lm_optimizer.step()
         info.update(dict_mean(info_list))
+        
+        # V-function ablation analysis
+        if eval_value_functions and self.step % eval_freq == 0 and len(replay_buffer.buffer) > 100:
+            print(">>>Evaluating value functions")
+            try:
+                # Evaluate value functions against MC returns
+                value_metrics = self.evaluate_value_functions(replay_buffer, n_samples=min(500, len(replay_buffer.buffer)))
+                info.update(value_metrics)
+                
+                # Compute TD errors
+                td_metrics = self.compute_td_errors(replay_buffer, n_samples=min(500, len(replay_buffer.buffer)))
+                info.update(td_metrics)
+                
+                print(f"V-function evaluation completed - V1 MSE: {value_metrics.get('value_eval.v1.mse', 'N/A'):.4f}, "
+                      f"V_min correlation: {value_metrics.get('value_eval.v_min.pearson_corr', 'N/A'):.4f}")
+                      
+            except Exception as e:
+                print(f"V-function evaluation failed: {e}")
+                # Add fallback metrics
+                info.update({
+                    'value_eval.status': 'failed',
+                    'value_eval.error': str(e)
+                })
+        
         return info
+
+    def compute_mc_returns(self, trajectory_data, gamma=None):
+        """
+        Compute true Monte Carlo returns for trajectory data
+        G_t = r_{t+1} + γr_{t+2} + γ²r_{t+3} + ...
+        
+        Args:
+            trajectory_data: List of trajectory steps with 'reward' key
+            gamma: Discount factor (uses self.gamma if None)
+        
+        Returns:
+            List of MC returns for each step
+        """
+        if gamma is None:
+            gamma = self.gamma
+            
+        mc_returns = []
+        G = 0
+        
+        # Compute returns backwards through trajectory
+        for step in reversed(trajectory_data):
+            G = step['reward'] + gamma * G
+            mc_returns.append(G)
+        
+        return list(reversed(mc_returns))
+
+    def evaluate_value_functions(self, replay_buffer, n_samples=500):
+        """
+        Evaluate learned V-functions against true Monte Carlo returns
+        
+        Args:
+            replay_buffer: ReplayBuffer containing experience
+            n_samples: Number of samples to evaluate
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        mc_returns = []
+        v1_predictions = []
+        v2_predictions = []
+        v_min_predictions = []
+        
+        # Sample trajectories and compute MC returns
+        sampled_data = []
+        for _ in range(min(n_samples, len(replay_buffer.buffer))):
+            sample = replay_buffer.sample(1)
+            for k, v in sample.items():
+                sample[k] = v[0]
+            sampled_data.append(sample)
+        
+        # Group samples by trajectory if possible
+        # For now, treat each sample independently
+        for sample in sampled_data:
+            # Get learned V-function predictions
+            with torch.no_grad():
+                _, _, v1, v2 = self.agent.critic(sample['observation'], sample['action'])
+                v1_val = v1.flatten().cpu().numpy()[0]
+                v2_val = v2.flatten().cpu().numpy()[0]
+                v_min_val = min(v1_val, v2_val)
+                
+                v1_predictions.append(v1_val)
+                v2_predictions.append(v2_val)
+                v_min_predictions.append(v_min_val)
+                
+                # Compute simple MC estimate (r + γV(s'))
+                if sample['done']:
+                    mc_return = sample['reward']
+                else:
+                    _, _, next_v1, next_v2 = self.agent.critic(sample['next_observation'], sample['action'])
+                    next_v = min(next_v1.flatten().cpu().numpy()[0], next_v2.flatten().cpu().numpy()[0])
+                    mc_return = sample['reward'] + self.gamma * next_v
+                
+                mc_returns.append(mc_return)
+        
+        if len(mc_returns) == 0:
+            return {}
+            
+        # Convert to numpy for easier computation
+        mc_returns = np.array(mc_returns)
+        v1_predictions = np.array(v1_predictions)
+        v2_predictions = np.array(v2_predictions)
+        v_min_predictions = np.array(v_min_predictions)
+        
+        # Compute metrics for V1, V2, and min(V1,V2)
+        metrics = {}
+        
+        for name, predictions in [('v1', v1_predictions), ('v2', v2_predictions), ('v_min', v_min_predictions)]:
+            # Correlation metrics
+            if len(predictions) > 1 and np.var(predictions) > 0 and np.var(mc_returns) > 0:
+                try:
+                    pearson_corr = np.corrcoef(mc_returns, predictions)[0, 1]
+                    # Compute spearman manually since scipy might not be available
+                    spearman_corr = pearson_corr  # Fallback to Pearson
+                except:
+                    pearson_corr = 0.0
+                    spearman_corr = 0.0
+            else:
+                pearson_corr = 0.0
+                spearman_corr = 0.0
+                
+            # Error metrics
+            mse = np.mean((mc_returns - predictions)**2)
+            mae = np.mean(np.abs(mc_returns - predictions))
+            bias = np.mean(predictions - mc_returns)
+            
+            # Explained variance
+            if np.var(mc_returns) > 0:
+                explained_var = 1 - np.var(mc_returns - predictions) / np.var(mc_returns)
+            else:
+                explained_var = 0.0
+            
+            metrics.update({
+                f'value_eval.{name}.pearson_corr': pearson_corr,
+                f'value_eval.{name}.spearman_corr': spearman_corr,
+                f'value_eval.{name}.mse': mse,
+                f'value_eval.{name}.mae': mae,
+                f'value_eval.{name}.bias': bias,
+                f'value_eval.{name}.explained_variance': explained_var,
+                f'value_eval.{name}.mean': np.mean(predictions),
+                f'value_eval.{name}.std': np.std(predictions),
+            })
+        
+        # MC return statistics
+        metrics.update({
+            'value_eval.mc_returns.mean': np.mean(mc_returns),
+            'value_eval.mc_returns.std': np.std(mc_returns),
+            'value_eval.mc_returns.min': np.min(mc_returns),
+            'value_eval.mc_returns.max': np.max(mc_returns),
+        })
+        
+        return metrics
+
+    def compute_td_errors(self, replay_buffer, n_samples=500):
+        """
+        Compute temporal difference errors: δ = r + γV(s') - V(s)
+        If V is accurate, TD errors should be small and unbiased
+        
+        Args:
+            replay_buffer: ReplayBuffer containing experience
+            n_samples: Number of samples to evaluate
+            
+        Returns:
+            Dictionary with TD error statistics
+        """
+        td_errors_v1 = []
+        td_errors_v2 = []
+        td_errors_v_min = []
+        
+        # Sample from replay buffer
+        for _ in range(min(n_samples, len(replay_buffer.buffer))):
+            sample = replay_buffer.sample(1)
+            for k, v in sample.items():
+                sample[k] = v[0]
+            
+            with torch.no_grad():
+                # Get current state values
+                _, _, v1_s, v2_s = self.agent.critic(sample['observation'], sample['action'])
+                v1_s = v1_s.flatten().cpu().numpy()[0]
+                v2_s = v2_s.flatten().cpu().numpy()[0]
+                v_min_s = min(v1_s, v2_s)
+                
+                # Get next state values
+                if sample['done']:
+                    v1_s_next = 0.0
+                    v2_s_next = 0.0
+                    v_min_s_next = 0.0
+                else:
+                    _, _, v1_next, v2_next = self.agent.critic(sample['next_observation'], sample['action'])
+                    v1_s_next = v1_next.flatten().cpu().numpy()[0]
+                    v2_s_next = v2_next.flatten().cpu().numpy()[0]
+                    v_min_s_next = min(v1_s_next, v2_s_next)
+                
+                # Compute TD targets
+                reward = sample['reward']
+                td_target_v1 = reward + self.gamma * v1_s_next
+                td_target_v2 = reward + self.gamma * v2_s_next
+                td_target_v_min = reward + self.gamma * v_min_s_next
+                
+                # Compute TD errors
+                td_error_v1 = td_target_v1 - v1_s
+                td_error_v2 = td_target_v2 - v2_s
+                td_error_v_min = td_target_v_min - v_min_s
+                
+                td_errors_v1.append(td_error_v1)
+                td_errors_v2.append(td_error_v2)
+                td_errors_v_min.append(td_error_v_min)
+        
+        if len(td_errors_v1) == 0:
+            return {}
+            
+        # Convert to numpy
+        td_errors_v1 = np.array(td_errors_v1)
+        td_errors_v2 = np.array(td_errors_v2)
+        td_errors_v_min = np.array(td_errors_v_min)
+        
+        # Compute statistics
+        metrics = {}
+        for name, errors in [('v1', td_errors_v1), ('v2', td_errors_v2), ('v_min', td_errors_v_min)]:
+            metrics.update({
+                f'td_error.{name}.mean': np.mean(errors),
+                f'td_error.{name}.std': np.std(errors),
+                f'td_error.{name}.abs_mean': np.mean(np.abs(errors)),
+                f'td_error.{name}.min': np.min(errors),
+                f'td_error.{name}.max': np.max(errors),
+            })
+        
+        return metrics
+
+    def evaluate_v_functions_on_trajectories(self, trajectories, n_trajectories=50):
+        """
+        Evaluate V-functions using complete trajectories with true MC returns
+        This provides the most accurate evaluation of value function quality
+        
+        Args:
+            trajectories: List of complete trajectories from training
+            n_trajectories: Number of trajectories to evaluate
+            
+        Returns:
+            Dictionary with comprehensive evaluation metrics
+        """
+        if not trajectories or len(trajectories) == 0:
+            return {}
+            
+        # Sample random trajectories
+        sampled_trajectories = random.sample(trajectories, min(n_trajectories, len(trajectories)))
+        
+        mc_returns_all = []
+        v1_predictions_all = []
+        v2_predictions_all = []
+        v_min_predictions_all = []
+        trajectory_lengths = []
+        
+        for trajectory in sampled_trajectories:
+            # Each trajectory is a list of steps
+            if len(trajectory) == 0:
+                continue
+                
+            # Compute true MC returns for this trajectory
+            mc_returns = self.compute_mc_returns(trajectory)
+            trajectory_lengths.append(len(trajectory))
+            
+            # Get V-function predictions for each state in trajectory
+            for i, (step, mc_return) in enumerate(zip(trajectory, mc_returns)):
+                try:
+                    with torch.no_grad():
+                        # Get V-function predictions for this state
+                        _, _, v1, v2 = self.agent.critic(step['observation'], step['action'])
+                        v1_val = v1.flatten().cpu().numpy()[0]
+                        v2_val = v2.flatten().cpu().numpy()[0]
+                        v_min_val = min(v1_val, v2_val)
+                        
+                        mc_returns_all.append(mc_return)
+                        v1_predictions_all.append(v1_val)
+                        v2_predictions_all.append(v2_val)
+                        v_min_predictions_all.append(v_min_val)
+                        
+                except Exception as e:
+                    print(f"Error processing step {i} in trajectory: {e}")
+                    continue
+        
+        if len(mc_returns_all) == 0:
+            return {'trajectory_eval.status': 'no_valid_data'}
+            
+        # Convert to numpy
+        mc_returns_all = np.array(mc_returns_all)
+        v1_predictions_all = np.array(v1_predictions_all)
+        v2_predictions_all = np.array(v2_predictions_all)
+        v_min_predictions_all = np.array(v_min_predictions_all)
+        
+        # Compute comprehensive metrics
+        metrics = {}
+        
+        for name, predictions in [('v1', v1_predictions_all), ('v2', v2_predictions_all), ('v_min', v_min_predictions_all)]:
+            # Correlation metrics (more reliable with larger sample)
+            if len(predictions) > 2 and np.var(predictions) > 1e-8 and np.var(mc_returns_all) > 1e-8:
+                try:
+                    pearson_corr = np.corrcoef(mc_returns_all, predictions)[0, 1]
+                    if np.isnan(pearson_corr):
+                        pearson_corr = 0.0
+                except:
+                    pearson_corr = 0.0
+            else:
+                pearson_corr = 0.0
+                
+            # Error metrics
+            mse = np.mean((mc_returns_all - predictions)**2)
+            mae = np.mean(np.abs(mc_returns_all - predictions))
+            bias = np.mean(predictions - mc_returns_all)
+            
+            # Explained variance
+            if np.var(mc_returns_all) > 1e-8:
+                explained_var = 1 - np.var(mc_returns_all - predictions) / np.var(mc_returns_all)
+                explained_var = max(0.0, explained_var)  # Clamp to [0, 1]
+            else:
+                explained_var = 0.0
+            
+            # Rank correlation (order preservation)
+            try:
+                rank_corr = np.corrcoef(np.argsort(mc_returns_all), np.argsort(predictions))[0, 1]
+                if np.isnan(rank_corr):
+                    rank_corr = 0.0
+            except:
+                rank_corr = 0.0
+            
+            metrics.update({
+                f'trajectory_eval.{name}.pearson_corr': pearson_corr,
+                f'trajectory_eval.{name}.rank_corr': rank_corr,
+                f'trajectory_eval.{name}.mse': mse,
+                f'trajectory_eval.{name}.mae': mae,
+                f'trajectory_eval.{name}.bias': bias,
+                f'trajectory_eval.{name}.explained_variance': explained_var,
+                f'trajectory_eval.{name}.mean': np.mean(predictions),
+                f'trajectory_eval.{name}.std': np.std(predictions),
+                f'trajectory_eval.{name}.min': np.min(predictions),
+                f'trajectory_eval.{name}.max': np.max(predictions),
+            })
+        
+        # MC return and trajectory statistics
+        metrics.update({
+            'trajectory_eval.mc_returns.mean': np.mean(mc_returns_all),
+            'trajectory_eval.mc_returns.std': np.std(mc_returns_all),
+            'trajectory_eval.mc_returns.min': np.min(mc_returns_all),
+            'trajectory_eval.mc_returns.max': np.max(mc_returns_all),
+            'trajectory_eval.n_trajectories': len(sampled_trajectories),
+            'trajectory_eval.n_steps': len(mc_returns_all),
+            'trajectory_eval.avg_trajectory_length': np.mean(trajectory_lengths) if trajectory_lengths else 0,
+            'trajectory_eval.status': 'success'
+        })
+        
+        return metrics
 
     def save(self, path):
         torch.save({'model_state_dict': self.accelerator.unwrap_model(self.agent.model).state_dict(),
