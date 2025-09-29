@@ -3,18 +3,18 @@ defaults:
   - _self_
 
 # checkpoint
-checkpoint_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/gpt2_bc_20q.pt'
-save_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/gpt2_bc_20q_HRL.pt'
+checkpoint_path: '/scratch/s/shahradm/archer/20q/gpt2_bc_20q.pt'
+save_path: '/scratch/s/shahradm/archer/20q/gpt2_bc_20q_HRL.pt'
 
 # env
 env_name: twenty_questions
-env_load_path: '/network/scratch/s/shahrad.mohammadzadeh/archer/20q/20q_t5_oracle.pt'
+env_load_path: '/scratch/s/shahradm/archer/20q/20q_t5_oracle.pt'
 
 # training hyperparameters
 rollout_size: 128 #number of rollout trajectories for each update
-batch_size: 32
-iterations: 500 #total number of iterations
-epochs: 5 #number of epochs for the critic each iteration
+batch_size: 64
+iterations: 1000 #total number of iterations
+epochs: 10 #number of epochs for the critic each iteration
 actor_epochs: 3 #number of epochs for the actor each iteration
 warmup_iter: 20 #number of iterations without updating the policy
 grad_accum_steps: 16

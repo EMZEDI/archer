@@ -1,11 +1,9 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
-num_processes: 4  # The number of GPUs you want to use
+num_processes: 4
 deepspeed_config:
-  deepspeed_config_file: ds_config.json # Path to your DeepSpeed JSON config
-  zero3_init_flag: false
+  deepspeed_config_file: scripts/config/accelerate_config/ds_config.json
 machine_rank: 0
 main_training_function: main
-mixed_precision: 'fp16' # Or 'bf16'
 num_machines: 1
 use_cpu: false

@@ -21,8 +21,8 @@ class ArcherTrainer():
     def __init__(self, agent,\
                  accelerator,\
                     tokenizer,\
-                    critic_lr: float = 1e-3,\
-                    lm_lr: float = 1e-5,\
+                    critic_optimizer, \
+                    lm_optimizer, \
                     grad_accum_steps: int = 8,\
                     gamma: float = 0.9,
                     tau: float = 0.1,
@@ -34,9 +34,12 @@ class ArcherTrainer():
         """
         super().__init__()
         self.agent = agent
+        if hasattr(self.agent.critic, "base_lm"):
+            self.agent.critic.base_lm.gradient_checkpointing_enable()
         self.tokenizer = tokenizer
-        self.lm_optimizer = torch.optim.Adam(agent.model.parameters(), lr = lm_lr)
-        self.critic_optimizer = torch.optim.Adam(agent.critic.parameters(), lr = critic_lr)
+        # Optimizers are now passed in directly
+        self.lm_optimizer = lm_optimizer
+        self.critic_optimizer = critic_optimizer
         self.criterion = torch.nn.MSELoss()
         self.grad_accum_steps = grad_accum_steps
         self.actor_epochs = actor_epochs
@@ -46,121 +49,160 @@ class ArcherTrainer():
         self.tau = tau
         self.max_grad_norm = max_grad_norm
         self.accelerator = accelerator
-        self.critic_optimizer, self.lm_optimizer = self.accelerator.prepare(self.critic_optimizer, self.lm_optimizer)
 
-    def critic_loss(self, observation, action, reward, next_observation, done, mc_return,**kwargs):
-        reward = torch.Tensor(reward).to(self.accelerator.unwrap_model(self.agent.model).device, dtype = self.accelerator.unwrap_model(self.agent.model).dtype).flatten()
-        done = torch.Tensor(done).to(self.accelerator.unwrap_model(self.agent.model).device, dtype = self.accelerator.unwrap_model(self.agent.model).dtype).flatten()
-        q1, q2, v1, v2 = self.agent.critic(observation, action, detach_model=False)
-        # print("finish one forward pass")
+    def q_loss(self, observation, action, reward, next_observation, done, **kwargs):
+        reward = torch.tensor(reward, device=self.accelerator.device, dtype=torch.float32).flatten()
+        done = torch.tensor(done, device=self.accelerator.device, dtype=torch.float32).flatten()
+        
+        q1, q2, _, _ = self.agent.critic(observation, action, detach_model=False)
+        q1, q2 = q1.flatten(), q2.flatten()
+
         with torch.no_grad():
-            pi_action = self.agent.get_action(copy.deepcopy(observation))
-            # target_q1, target_q2 = self.agent.get_q(observation, pi_action, detach_model=False)
-            target_q1, target_q2, _ , _ = self.agent.target_critic(copy.deepcopy(observation), pi_action, detach_model=False)
-        q1 = q1.flatten()
-        q2 = q2.flatten()
-        v1 = v1.flatten()
-        v2 = v2.flatten()
-        target_q1 = target_q1.flatten()
-        target_q2 = target_q2.flatten()
-        with torch.no_grad():
-            #action is dummy here
-            _, _ , target_v1, target_v2 = self.agent.target_critic(next_observation, copy.deepcopy(action))
-            target_v1 = reward + (1 - done)*target_v1.flatten()*self.gamma
-            target_v2 = reward + (1 - done)*target_v2.flatten()*self.gamma
-        # target_v1 = torch.zeros_like(q1)
-        # target_v2 = torch.zeros_like(q2)
+            next_action = self.agent.get_action(next_observation)
+            _, _, target_v1, target_v2 = self.agent.target_critic(next_observation, next_action)
+            target_v1 = reward + (1 - done) * target_v1.flatten() * self.gamma
+            target_v2 = reward + (1 - done) * target_v2.flatten() * self.gamma
+        
         q1_loss = self.criterion(q1, target_v1)
         q2_loss = self.criterion(q2, target_v2)
+        total_loss = q1_loss + q2_loss
+
+        q1_cpu, q2_cpu = q1.detach().cpu(), q2.detach().cpu()
+        target_v1_cpu, target_v2_cpu = target_v1.detach().cpu(), target_v2.detach().cpu()
+
+        metrics = {
+            "q.total_loss": total_loss.detach().cpu().item(),
+            "q1.loss": q1_loss.detach().cpu().item(),
+            "q2.loss": q2_loss.detach().cpu().item(),
+            "q1.mean": q1_cpu.mean().item(),
+            "q1.min": q1_cpu.min().item(),
+            "q1.max": q1_cpu.max().item(),
+            "q1.std": q1_cpu.std(unbiased=False).item(),
+            "q2.mean": q2_cpu.mean().item(),
+            "q2.min": q2_cpu.min().item(),
+            "q2.max": q2_cpu.max().item(),
+            "q2.std": q2_cpu.std(unbiased=False).item(),
+            "target_v1.mean": target_v1_cpu.mean().item(),
+            "target_v1.min": target_v1_cpu.min().item(),
+            "target_v1.max": target_v1_cpu.max().item(),
+            "target_v1.std": target_v1_cpu.std(unbiased=False).item(),
+            "target_v2.mean": target_v2_cpu.mean().item(),
+            "target_v2.min": target_v2_cpu.min().item(),
+            "target_v2.max": target_v2_cpu.max().item(),
+            "target_v2.std": target_v2_cpu.std(unbiased=False).item(),
+        }
+
+        return total_loss, metrics
+
+    def v_loss(self, observation, pi_action=None, **kwargs):
+        if pi_action is None:
+            with torch.no_grad():
+                pi_action = self.agent.get_action(observation)
+        _, _, v1, v2 = self.agent.critic(observation, pi_action, detach_model=False)
+        v1, v2 = v1.flatten(), v2.flatten()
+
+        with torch.no_grad():
+            target_q1, target_q2, _, _ = self.agent.target_critic(observation, pi_action, detach_model=False)
+            target_q1, target_q2 = target_q1.flatten(), target_q2.flatten()
+
         v1_loss = self.criterion(v1, target_q1)
         v2_loss = self.criterion(v2, target_q2)
-        self.accelerator.backward((q1_loss+q2_loss+v1_loss+ v2_loss))
-        q1_loss, q2_loss, v1_loss, v2_loss = q1_loss.detach().cpu(), q2_loss.detach().cpu(),\
-                                             v1_loss.detach().cpu(), v2_loss.detach().cpu()
-        q1, q2, v1, v2, target_q1, target_q2 = q1.detach().cpu(), q2.detach().cpu(), v1.detach().cpu(),\
-                                            v2.detach().cpu(), target_q1.detach().cpu(), target_q2.detach().cpu()
-        return {"q1.loss": q1_loss,\
-                    "q2.loss": q2_loss,\
-                    "v1.loss": v1_loss,\
-                    "v2.loss": v2_loss,\
-                    "q1.mean": torch.mean(q1),\
-                    "q1.min": torch.min(q1),\
-                    "q1.max": torch.max(q1),\
-                    "q1.std": torch.std(q1),\
-                    "q2.mean": torch.mean(q2),
-                    "q2.max": torch.max(q2),
-                    "q2.min": torch.min(q2),
-                    "q2.std": torch.std(q2),\
-                    "v1.mean": torch.mean(v1),\
-                    "v1.min": torch.min(v1),\
-                    "v1.max": torch.max(v1),\
-                    "v1.std": torch.std(v1),
-                    "v2.mean": torch.mean(v2),
-                    "v2.max": torch.max(v2),
-                    "v2.min": torch.min(v2),
-                    "v2.std": torch.std(v2),
-                    "target_q1.mean": torch.mean(target_q1),\
-                    "target_q1.min": torch.min(target_q1),\
-                    "target_q1.max": torch.max(target_q1),\
-                    "target_q1.std": torch.std(target_q1),
-                    "target_q2.mean": torch.mean(target_q2),
-                    "target_q2.max": torch.max(target_q2),
-                    "target_q2.min": torch.min(target_q2),
-                    "target_q2.std": torch.std(target_q2),}
+        total_loss = v1_loss + v2_loss
+
+        v1_cpu, v2_cpu = v1.detach().cpu(), v2.detach().cpu()
+        target_q1_cpu, target_q2_cpu = target_q1.detach().cpu(), target_q2.detach().cpu()
+
+        metrics = {
+            "v.total_loss": total_loss.detach().cpu().item(),
+            "v1.loss": v1_loss.detach().cpu().item(),
+            "v2.loss": v2_loss.detach().cpu().item(),
+            "v1.mean": v1_cpu.mean().item(),
+            "v1.min": v1_cpu.min().item(),
+            "v1.max": v1_cpu.max().item(),
+            "v1.std": v1_cpu.std(unbiased=False).item(),
+            "v2.mean": v2_cpu.mean().item(),
+            "v2.min": v2_cpu.min().item(),
+            "v2.max": v2_cpu.max().item(),
+            "v2.std": v2_cpu.std(unbiased=False).item(),
+            "target_q1.mean": target_q1_cpu.mean().item(),
+            "target_q1.min": target_q1_cpu.min().item(),
+            "target_q1.max": target_q1_cpu.max().item(),
+            "target_q1.std": target_q1_cpu.std(unbiased=False).item(),
+            "target_q2.mean": target_q2_cpu.mean().item(),
+            "target_q2.min": target_q2_cpu.min().item(),
+            "target_q2.max": target_q2_cpu.max().item(),
+            "target_q2.std": target_q2_cpu.std(unbiased=False).item(),
+        }
+
+        return total_loss, metrics
 
     def actor_loss(self, observation, pi_action, advantage, **kwargs):
-        # with torch.no_grad():
-        #     pi_action = self.agent.get_action(observation)
-        # breakpoint()
-        # action = [a if random.random()>0.5 else pi_a for a, pi_a in zip(batch_action, pi_action)]
-        action = pi_action
-        log_prob = self.agent.get_log_prob(observation, action)
-        advantage = torch.Tensor(advantage).to(self.accelerator.unwrap_model(self.agent.model).device, dtype = self.accelerator.unwrap_model(self.agent.model).dtype)
-        #in the case where a baseline is used
+        log_prob = self.agent.get_log_prob(observation, pi_action)
+        advantage_tensor = torch.tensor(advantage, device=self.accelerator.unwrap_model(self.agent.model).device, dtype=self.accelerator.unwrap_model(self.agent.model).dtype)
+
         if isinstance(log_prob, Tuple):
             values, log_prob, mask = log_prob
             values = values.squeeze(-1)
-            advantage = advantage.reshape(-1, 1).broadcast_to(values.size())
-            value_loss = torch.mean(((advantage - values)*mask)**2)
-            with torch.no_grad():
-                residual_advantage = advantage - values
-            pg_loss = -torch.mean(torch.sum(residual_advantage*log_prob*mask, dim = 1))
-
+            mask = mask.to(values.dtype)
+            expanded_advantage = advantage_tensor.reshape(values.shape)
+            residual_advantage = (expanded_advantage - values) * mask
+            pg_loss = -torch.mean(torch.sum(residual_advantage * log_prob * mask, dim=1))
+            value_loss = torch.mean(residual_advantage.pow(2))
+            advantages_flat = (expanded_advantage * mask).detach().cpu().view(expanded_advantage.size(0), -1).mean(dim=1)
+            values_flat = (values * mask).detach().cpu().view(values.size(0), -1).mean(dim=1)
+            residual_flat = residual_advantage.detach().cpu().view(residual_advantage.size(0), -1)
         else:
-            advantages = advantage.flatten()
-            values = torch.zeros_like(advantages)
-            residual_advantage = torch.zeros_like(advantages)
-            # ratio = torch.exp(log_prob - old_log_prob).flatten()
-            # pg_loss1 = -advantages*ratio
-            # pg_loss2 = -advantages*torch.clip(ratio, 1 - self.clip_range, 1+ self.clip_range)
-            # pg_loss = torch.mean(torch.maximum(pg_loss1, pg_loss2))
-            pg_loss = -torch.mean(log_prob.flatten()*advantages)
+            advantages_flat = advantage_tensor.flatten()
+            pg_loss = -torch.mean(log_prob.flatten() * advantages_flat)
             value_loss = torch.zeros_like(pg_loss)
-        advantages = advantage.flatten()
-        self.accelerator.backward(pg_loss+value_loss)
-        advantages = advantages.detach().cpu()
-        return {"pg.loss": pg_loss.detach().cpu().item(),
-                "values.loss": value_loss.detach().cpu().item(),
-                "values.mean": values.mean(),
-                "values.max": torch.max(values),
-                "values.min": torch.min(values),
-                "values.std": torch.std(values),
-                "advantages.mean": advantages.mean(),
-                "advantages.max": torch.max(advantages),
-                "advantages.min": torch.min(advantages),
-                "advantages.std": torch.std(advantages),
-                "residual_advantages.mean": residual_advantage.mean(),
-                "residual_advantages.max": torch.max(residual_advantage),
-                "residual_advantages.min": torch.min(residual_advantage),
-                "residual_advantages.std": torch.std(residual_advantage),}
+            values_flat = torch.zeros_like(advantages_flat).detach().cpu()
+            residual_flat = torch.zeros_like(advantages_flat).detach().cpu()
+
+        self.accelerator.backward(pg_loss + value_loss)
+
+        advantages_cpu = advantages_flat.detach().cpu()
+        metrics = {
+            "pg.loss": pg_loss.detach().cpu().item(),
+            "values.loss": value_loss.detach().cpu().item(),
+            "advantages.mean": advantages_cpu.mean().item(),
+            "advantages.std": advantages_cpu.std(unbiased=False).item(),
+            "advantages.max": advantages_cpu.max().item(),
+            "advantages.min": advantages_cpu.min().item(),
+        }
+
+        if isinstance(log_prob, Tuple):
+            metrics.update({
+                "values.mean": values_flat.mean().item(),
+                "values.std": values_flat.std(unbiased=False).item(),
+                "values.max": values_flat.max().item(),
+                "values.min": values_flat.min().item(),
+                "residual_advantages.mean": residual_flat.mean().item(),
+                "residual_advantages.std": residual_flat.std(unbiased=False).item(),
+                "residual_advantages.max": residual_flat.max().item(),
+                "residual_advantages.min": residual_flat.min().item(),
+            })
+        else:
+            metrics.update({
+                "values.mean": 0.0,
+                "values.std": 0.0,
+                "values.max": 0.0,
+                "values.min": 0.0,
+                "residual_advantages.mean": 0.0,
+                "residual_advantages.std": 0.0,
+                "residual_advantages.max": 0.0,
+                "residual_advantages.min": 0.0,
+            })
+
+        return metrics
+
 
     def update(self, replay_buffer, no_update_actor=False, eval_value_functions=True, eval_freq=10):
         self.step += 1
         info = {}
-        info_list = []
-        # self.agent.critic, self.agent.target_critic = self.accelerator.prepare(self.agent.critic, self.agent.target_critic)
+        q_info_list, v_info_list, info_list = [], [], []
+        
         with torch.autograd.set_detect_anomaly(True):
-            # self.agent, self.critic_optimizer = self.accelerator.prepare(self.agent, self.critic_optimizer)
+            # --- Combined Critic Update (Q and V together to avoid DDP issues) ---
             for _ in range(self.epochs):
                 data = [replay_buffer.sample(1) for _ in range(self.grad_accum_steps*replay_buffer.batch_size)]
                 for d in data:
@@ -168,20 +210,25 @@ class ArcherTrainer():
                         d[k] = v[0]
                 dataloader = DataLoader(DummyDataset(data), batch_size=replay_buffer.batch_size)
                 dataloader = self.accelerator.prepare(dataloader)
-                # import IPython; IPython.embed()
-                # self.agent, self.critic_optimizer, dataloader = \
-                #     self.accelerator.prepare(self.agent,  self.critic_optimizer, dataloader)
+                
                 self.critic_optimizer.zero_grad()
-                grad_index = 0
-                for batch in tqdm(dataloader, disable=True):
-
-                    info_list.append(self.critic_loss(**batch))
-                self.accelerator.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
+                for batch in tqdm(dataloader, disable=True, desc="Critic-Update"):
+                    with torch.no_grad():
+                        pi_action = self.agent.get_action(batch["observation"])
+                    q_loss, q_info = self.q_loss(**batch)
+                    v_loss, v_info = self.v_loss(batch["observation"], pi_action=pi_action)
+                    q_info_list.append(q_info)
+                    v_info_list.append(v_info)
+                    combined_loss = q_loss + v_loss
+                    combined_loss.backward()
+                    
+                torch.nn.utils.clip_grad_norm_(self.agent.critic.parameters(), self.max_grad_norm)
                 self.critic_optimizer.step()
-                # if self.accelerator.is_main_process:
-                self.agent.soft_update_target_critic(tau=self.tau)
-        info.update(dict_mean(info_list))
-        info_list = []
+
+            self.agent.soft_update_target_critic(tau=self.tau)
+
+        info.update(dict_mean(q_info_list))
+        info.update(dict_mean(v_info_list))
         #update actor
         if not no_update_actor:
             print(">>>updating actor")
@@ -190,69 +237,64 @@ class ArcherTrainer():
             #action_bsize = replay_buffer.batch_size
             for _ in range(self.actor_epochs):
                 data = [replay_buffer.sample(1) for _ in range(self.grad_accum_steps*replay_buffer.batch_size)]
-                grad_index = 0
                 for d in data:
                     for k,v in d.items():
                         d[k] = v[0]
-                dataloader = DataLoader(DummyDataset(data), batch_size=action_bsize, shuffle=False)
-                all_pi_actions = []
-                all_advantages = []
-                # import IPython; IPython.embed()
+                
+                dataloader = DataLoader(DummyDataset(data), batch_size=action_bsize, shuffle=True)
                 dataloader = self.accelerator.prepare(dataloader)
-                #calculate advantages and pi_action beforehand due to memory concern
-                # with self.accelerator.no_sync(self.agent):
-                # for batch in dataloader:
-                #     with torch.no_grad():
-                #         pi_action = self.agent.get_action(batch["observation"])
-                #         # batch["pi_action"] = pi_action
-                #         q1, q2 = self.agent.get_q(batch["observation"], pi_action)
-                #         q = torch.minimum(q1, q2)
-                #         v1, v2 = self.agent.get_v(batch["observation"]) 
-                #         v = torch.minimum(v1, v2)
-                #         advantages = q - v
-                        # batch["advantage"] = advantages
-                        # all_pi_actions += pi_action
-                        # all_advantages += advantages.flatten().cpu().numpy().tolist()
-                # new_data = copy.deepcopy(data)
-                # for d, pi_action, advantage in zip(new_data, all_pi_actions, all_advantages):
-                #     d["pi_action"] = pi_action
-                #     d["advantage"] = advantage
-                # # import IPython; IPython.embed()
-                # # print(new_data[0])
-                # new_dataloader = DataLoader(DummyDataset(new_data), batch_size=action_bsize, shuffle=False)
-                # # breakpoint()
-                # new_dataloader = self.accelerator.prepare(new_dataloader)
+
+                # Pre-generate all actions for this epoch to reduce LLM calls
+                print(">>> Pre-generating policy actions for actor update...")
+                all_observations = []
+                epoch_data = []
+                for batch_data in data:
+                    all_observations.append(batch_data['observation'])
+                    epoch_data.append(batch_data)
+                
+                # Generate actions in larger batches
+                action_batch_size = 8 if 'mistral' in self.agent.policy_lm else 16
+                all_pi_actions = []
+                
+                with torch.no_grad():
+                    for i in range(0, len(all_observations), action_batch_size):
+                        batch_obs = all_observations[i:i+action_batch_size]
+                        pi_actions = self.agent.get_action(batch_obs)
+                        all_pi_actions.extend(pi_actions)
+                
+                # Add generated actions to the data
+                for i, d in enumerate(epoch_data):
+                    if i < len(all_pi_actions):
+                        d['pi_action'] = all_pi_actions[i]
+                
+                # Now use the pre-generated actions
+                dataloader = DataLoader(DummyDataset(epoch_data), batch_size=action_bsize, shuffle=True)
+                dataloader = self.accelerator.prepare(dataloader)
+                
                 self.lm_optimizer.zero_grad()
                 for batch in dataloader:
-                # with self.accelerator.accumulate(self.agent):
-                    # for i in range(self.grad_accum_steps):
-                    # # for i, bc_batch in zip(range(self.grad_accum_steps), bc_dataloader):
-                    #     batch = replay_buffer.sample()
-                    #     # assert len(bc_batch) > 0
-                    #     assert i <  self.grad_accum_steps
                     with torch.no_grad():
-                        pi_action = self.agent.get_action(batch["observation"])
-                        # batch["pi_action"] = pi_action
+                        # Use pre-generated actions
+                        pi_action = batch['pi_action']
                         q1, q2, v1, v2 = self.agent.critic(batch["observation"], pi_action)
                         q = torch.minimum(q1, q2)
-                        # v1, v2 = self.agent.critic(batch["observation"]) 
                         v = torch.minimum(v1, v2)
                         advantages = q - v
-                    info_list.append(self.actor_loss(**batch, pi_action=pi_action, advantage=advantages))
-                self.accelerator.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
+                    info_list.append(self.actor_loss(observation=batch["observation"], pi_action=pi_action, advantage=advantages))
+                self.accelerator.clip_grad_norm_(self.agent.model.parameters(), self.max_grad_norm)
                 self.lm_optimizer.step()
         info.update(dict_mean(info_list))
         
         # V-function ablation analysis
-        if eval_value_functions and self.step % eval_freq == 0 and len(replay_buffer.buffer) > 100:
+        if eval_value_functions and self.step % eval_freq == 0 and len(replay_buffer) > 100:  
             print(">>>Evaluating value functions")
             try:
                 # Evaluate value functions against MC returns
-                value_metrics = self.evaluate_value_functions(replay_buffer, n_samples=min(500, len(replay_buffer.buffer)))
+                value_metrics = self.evaluate_value_functions(replay_buffer, n_samples=min(500, len(replay_buffer)))  
                 info.update(value_metrics)
                 
                 # Compute TD errors
-                td_metrics = self.compute_td_errors(replay_buffer, n_samples=min(500, len(replay_buffer.buffer)))
+                td_metrics = self.compute_td_errors(replay_buffer, n_samples=min(500, len(replay_buffer)))  
                 info.update(td_metrics)
                 
                 print(f"V-function evaluation completed - V1 MSE: {value_metrics.get('value_eval.v1.mse', 'N/A'):.4f}, "
@@ -304,14 +346,17 @@ class ArcherTrainer():
         Returns:
             Dictionary with evaluation metrics
         """
+        if len(replay_buffer) == 0:
+            return {}
+
         mc_returns = []
         v1_predictions = []
         v2_predictions = []
         v_min_predictions = []
-        
-        # Sample trajectories and compute MC returns
+
         sampled_data = []
-        for _ in range(min(n_samples, len(replay_buffer.buffer))):
+        num_samples = min(n_samples, len(replay_buffer))
+        for _ in range(num_samples):
             sample = replay_buffer.sample(1)
             for k, v in sample.items():
                 sample[k] = v[0]
@@ -411,12 +456,15 @@ class ArcherTrainer():
         Returns:
             Dictionary with TD error statistics
         """
+        if len(replay_buffer) == 0:
+            return {}
+
         td_errors_v1 = []
         td_errors_v2 = []
         td_errors_v_min = []
-        
-        # Sample from replay buffer
-        for _ in range(min(n_samples, len(replay_buffer.buffer))):
+
+        num_samples = min(n_samples, len(replay_buffer))
+        for _ in range(num_samples):
             sample = replay_buffer.sample(1)
             for k, v in sample.items():
                 sample[k] = v[0]

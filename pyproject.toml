@@ -89,6 +89,7 @@ dependencies = [
     "wandb",
     "beautifulsoup4",
     "sentencepiece",
+    "deepspeed>=0.17.6",
 ]
 
 [project.urls]
